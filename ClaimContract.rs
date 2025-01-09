@@ -1,349 +1,178 @@
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+use anchor_lang::prelude::*;
+use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 
-// Import required OpenZeppelin contracts
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/utils/Pausable.sol";
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+#[account]
+#[derive(Default)]
+pub struct DistributionState {
+    pub owner: Pubkey,
+    pub token_mint: Pubkey,
+    pub total_raised: u64,
+    pub allocation_calculated: bool,
+    pub claim_enabled: bool,
+    pub max_batch_size: u64,
+    pub claim_period_open: bool,
+    pub paused: bool,
+    pub contributors: Vec<Contributor>,
+}
 
-/**
- * @title PeacepalAIDistribution
- * @dev Contract for managing token distribution based on user contributions
- * Inherits from:
- * - Ownable: Manages contract ownership and access control
- * - ReentrancyGuard: Prevents reentrancy attacks
- * - Pausable: Allows pausing contract functionality in emergencies
- */
-contract PeacepalAIDistribution is Ownable, ReentrancyGuard, Pausable {
-    using SafeERC20 for IERC20; // Use SafeERC20 for safe token transfers
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Default)]
+pub struct Contributor {
+    pub user: Pubkey,
+    pub contribution: u64,
+    pub allocation: u64,
+}
 
-    // State Variables
-    IERC20 public token;              // The ERC20 token to be distributed
-    uint256 public totalRaised;       // Total amount of contributions
-    bool public allocationCalculated;  // Flag to track if allocations have been calculated
-    bool public claimEnabled;         // Flag to enable/disable claiming
-    uint256 public maxBatchSize;      // Maximum number of users in a batch operation
-    bool public claimPeriodOpen;      // Flag to track if claim period is active
+#[derive(Accounts)]
+pub struct InitializeDistribution<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
 
-    // Data structures for tracking contributors and their allocations
-    address[] public contributorList;                    // List of all contributors
-    mapping(address => bool) public isContributor;       // Track if address is a contributor
-    mapping(address => uint256) public contributions;    // Amount contributed by each address
-    mapping(address => uint256) public allocations;      // Token allocation for each address
+    #[account(
+        init,
+        payer = payer,
+        space = 8 + 32 + 32 + 8 + 1 + 1 + 8 + 1 + 1 + 4 + (2000 * (32 + 8 + 8))
+    )]
+    pub distribution_state: Account<'info, DistributionState>,
 
-    // Events
-    event TokenSet(address indexed tokenAddress);
-    event ContributionsUpdated(address[] users, uint256[] amounts);
-    event ContributionUpdated(address indexed user, uint256 amount);
-    event AllocationCalculated(uint256 totalRaised, uint256 totalTokensForDistribution);
-    event TokensClaimed(address indexed user, uint256 amount);
-    event ClaimEnabled();
-    event UnclaimedTokensWithdrawn(uint256 amount);
-    event MaxBatchSizeUpdated(uint256 newSize);
-    event ClaimPeriodOpened();
-    event ClaimPeriodClosed();
+    pub system_program: Program<'info, System>,
+}
 
-    // Custom errors for better gas efficiency and clearer error messages
-    error ZeroAddress();
-    error ZeroAmount();
-    error BatchTooLarge();
-    error ArrayLengthMismatch();
-    error AllocationAlreadyCalculated();
-    error NoContributions();
-    error NoTokenBalance();
-    error NotCalculated();
-    error NothingToClaim();
-    error TransferFailed();
-    error AllocationExceedsBalance();
-    error ClaimingNotEnabled();
-    error NoTokensToWithdraw();
-    error NotContributor();
-    error ContributionsLocked();
-    error ClaimPeriodActive();
+#[program]
+mod secure_distribution {
+    use super::*;
 
-    /**
-     * @dev Constructor sets initial maxBatchSize and initializes Ownable
-     */
-    constructor() Ownable(msg.sender) {
-        maxBatchSize = 500;
+    pub fn initialize_distribution(
+        ctx: Context<InitializeDistribution>,
+        owner: Pubkey,
+        max_batch_size: u64,
+    ) -> Result<()> {
+        require!(max_batch_size > 0, DistributionError::InvalidBatchSize);
+
+        let state = &mut ctx.accounts.distribution_state;
+        state.owner = owner;
+        state.token_mint = Pubkey::default();
+        state.total_raised = 0;
+        state.allocation_calculated = false;
+        state.claim_enabled = false;
+        state.max_batch_size = max_batch_size;
+        state.claim_period_open = false;
+        state.paused = false;
+        state.contributors = vec![];
+        
+        emit!(DistributionEvent::Initialized { owner, max_batch_size });
+        Ok(())
     }
 
-    /**
-     * @dev Sets the token address for distribution
-     * @param _token Address of the ERC20 token
-     * Requirements:
-     * - Only owner can call
-     * - Contract must not be paused
-     * - Token address cannot be zero
-     * - Claim period must not be active
-     */
-    function setToken(address _token) external onlyOwner whenNotPaused {
-        if (_token == address(0)) revert ZeroAddress();
-        if (claimPeriodOpen) revert ClaimPeriodActive();
-        token = IERC20(_token);
-        emit TokenSet(_token);
+    pub fn set_token(ctx: Context<SetToken>, token_mint: Pubkey) -> Result<()> {
+        let state = &mut ctx.accounts.distribution_state;
+        require_keys_eq!(state.owner, ctx.accounts.authority.key(), DistributionError::NotOwner);
+        require!(!state.paused, DistributionError::ContractPaused);
+        require!(!state.claim_period_open, DistributionError::ClaimPeriodActive);
+        require!(!state.allocation_calculated, DistributionError::AllocationAlreadyCalculated);
+
+        require!(token_mint != Pubkey::default(), DistributionError::InvalidTokenMint);
+        state.token_mint = token_mint;
+        emit!(DistributionEvent::TokenUpdated { token_mint });
+        Ok(())
     }
 
-    /**
-     * @dev Updates the maximum batch size for contribution operations
-     * @param newSize New maximum batch size
-     * Requirements:
-     * - Only owner can call
-     * - New size cannot be zero
-     */
-    function setMaxBatchSize(uint256 newSize) external onlyOwner {
-        if (newSize == 0) revert ZeroAmount();
-        maxBatchSize = newSize;
-        emit MaxBatchSizeUpdated(newSize);
-    }
+    pub fn batch_set_contributions(
+        ctx: Context<BatchSetContributions>,
+        users: Vec<Pubkey>,
+        amounts: Vec<u64>,
+    ) -> Result<()> {
+        let state = &mut ctx.accounts.distribution_state;
+        require_keys_eq!(state.owner, ctx.accounts.authority.key(), DistributionError::NotOwner);
+        require!(!state.paused, DistributionError::ContractPaused);
+        require!(!state.allocation_calculated, DistributionError::AllocationAlreadyCalculated);
+        require_eq!(users.len(), amounts.len(), DistributionError::ArrayLengthMismatch);
+        require!(users.len() as u64 <= state.max_batch_size, DistributionError::BatchTooLarge);
 
-    /**
-     * @dev Batch sets contributions for multiple users
-     * @param users Array of user addresses
-     * @param amounts Array of contribution amounts
-     * Requirements:
-     * - Only owner can call
-     * - Contract must not be paused
-     * - Allocations must not be already calculated
-     * - Arrays must be same length and not exceed maxBatchSize
-     */
-    function batchSetContributions(
-        address[] calldata users,
-        uint256[] calldata amounts
-    ) external onlyOwner whenNotPaused {
-        if (allocationCalculated) revert AllocationAlreadyCalculated();
-        if (users.length != amounts.length) revert ArrayLengthMismatch();
-        if (users.length > maxBatchSize) revert BatchTooLarge();
+        let mut seen_users = std::collections::HashSet::new();
+        for (i, user) in users.iter().enumerate() {
+            require!(seen_users.insert(user), DistributionError::DuplicateContributor);
+            let amount = amounts[i];
+            require!(amount > 0, DistributionError::InvalidAmount);
 
-        for (uint256 i = 0; i < users.length; i++) {
-            if (users[i] == address(0)) revert ZeroAddress();
-            if (amounts[i] == 0) revert ZeroAmount();
-
-            if (!isContributor[users[i]]) {
-                isContributor[users[i]] = true;
-                contributorList.push(users[i]);
-            }
-
-            // Update total raised (subtract old contribution if any, add new contribution)
-            totalRaised += amounts[i];
-            totalRaised -= contributions[users[i]];
-
-            contributions[users[i]] = amounts[i];
-
-            emit ContributionUpdated(users[i], amounts[i]);
-        }
-
-        emit ContributionsUpdated(users, amounts);
-    }
-
-    /**
-     * @dev Calculates token allocations based on contributions
-     * Requirements:
-     * - Only owner can call
-     * - Contract must not be paused
-     * - Token must be set
-     * - Must have contributions
-     * - Allocations must not be already calculated
-     * - Contract must have token balance
-     */
-    function calculateAllocations() external onlyOwner whenNotPaused {
-        if (address(token) == address(0)) revert ZeroAddress();
-        if (totalRaised == 0) revert NoContributions();
-        if (allocationCalculated) revert AllocationAlreadyCalculated();
-
-        uint256 totalTokens = token.balanceOf(address(this));
-        if (totalTokens == 0) revert NoTokenBalance();
-
-        uint256 allocatedAmount;
-
-        // Calculate proportional allocations
-        for (uint256 i = 0; i < contributorList.length; i++) {
-            address user = contributorList[i];
-            uint256 userContribution = contributions[user];
-
-            if (userContribution > 0) {
-                uint256 allocation = (userContribution * totalTokens) / totalRaised;
-                allocations[user] = allocation;
-                allocatedAmount += allocation;
+            if let Some(contributor) = state.contributors.iter_mut().find(|c| c.user == *user) {
+                state.total_raised = state.total_raised - contributor.contribution + amount;
+                contributor.contribution = amount;
+            } else {
+                state.contributors.push(Contributor {
+                    user: *user,
+                    contribution: amount,
+                    allocation: 0,
+                });
+                state.total_raised += amount;
             }
         }
 
-        if (allocatedAmount > totalTokens) revert AllocationExceedsBalance();
-
-        allocationCalculated = true;
-        emit AllocationCalculated(totalRaised, totalTokens);
+        emit!(DistributionEvent::ContributionsUpdated);
+        Ok(())
     }
 
-    /**
-     * @dev Enables token claiming
-     * Requirements:
-     * - Only owner can call
-     * - Contract must not be paused
-     * - Allocations must be calculated
-     */
-    function enableClaim() external onlyOwner whenNotPaused {
-        if (!allocationCalculated) revert NotCalculated();
-        claimEnabled = true;
-        emit ClaimEnabled();
-    }
+    pub fn calculate_allocations(ctx: Context<CalculateAllocations>) -> Result<()> {
+        let state = &mut ctx.accounts.distribution_state;
+        require_keys_eq!(state.owner, ctx.accounts.authority.key(), DistributionError::NotOwner);
+        require!(!state.paused, DistributionError::ContractPaused);
+        require!(state.token_mint != Pubkey::default(), DistributionError::InvalidTokenMint);
+        require!(state.total_raised > 0, DistributionError::NoContributions);
+        require!(!state.allocation_calculated, DistributionError::AllocationAlreadyCalculated);
 
-    /**
-     * @dev Opens the claim period
-     * Requirements:
-     * - Only owner can call
-     * - Contract must not be paused
-     * - Claiming must be enabled
-     */
-    function openClaimPeriod() external onlyOwner whenNotPaused {
-        if (!claimEnabled) revert ClaimingNotEnabled();
-        claimPeriodOpen = true;
-        emit ClaimPeriodOpened();
-    }
+        let token_account = &ctx.accounts.token_account;
+        let total_tokens = token_account.amount;
+        require!(total_tokens > 0, DistributionError::NoTokenBalance);
 
-    /**
-     * @dev Closes the claim period
-     * Requirements:
-     * - Only owner can call
-     * - Contract must not be paused
-     */
-    function closeClaimPeriod() external onlyOwner whenNotPaused {
-        claimPeriodOpen = false;
-        emit ClaimPeriodClosed();
-    }
-
-    /**
-     * @dev Allows users to claim their allocated tokens
-     * Requirements:
-     * - Contract must not be paused
-     * - Claiming must be enabled and period must be open
-     * - User must have allocation to claim
-     */
-    function claim() external nonReentrant whenNotPaused {
-        if (!claimEnabled) revert ClaimingNotEnabled();
-        if (!claimPeriodOpen) revert ClaimingNotEnabled();
-        if (allocations[msg.sender] == 0) revert NothingToClaim();
-
-        uint256 amount = allocations[msg.sender];
-        allocations[msg.sender] = 0;
-
-        token.safeTransfer(msg.sender, amount);
-        emit TokensClaimed(msg.sender, amount);
-    }
-
-    /**
-     * @dev Allows owner to withdraw unclaimed tokens
-     * Requirements:
-     * - Only owner can call
-     * - Contract must not be paused
-     * - Allocations must be calculated
-     * - Claim period must not be active
-     */
-    function withdrawUnclaimedTokens() external onlyOwner whenNotPaused {
-        if (!allocationCalculated) revert NotCalculated();
-        if (claimPeriodOpen) revert ClaimPeriodActive();
-        uint256 balance = token.balanceOf(address(this));
-        if (balance == 0) revert NoTokensToWithdraw();
-
-        emit UnclaimedTokensWithdrawn(balance);
-        token.safeTransfer(owner(), balance);
-    }
-
-    /**
-     * @dev Removes a contributor and their contribution
-     * @param user Address of contributor to remove
-     * Requirements:
-     * - Only owner can call
-     * - Contract must not be paused
-     * - Allocations must not be calculated
-     * - Address must be a contributor
-     */
-    function removeContributor(address user) external onlyOwner whenNotPaused {
-        if (allocationCalculated) revert ContributionsLocked();
-        if (!isContributor[user]) revert NotContributor();
-
-        isContributor[user] = false;
-        totalRaised -= contributions[user];
-        contributions[user] = 0;
-
-        // Remove from contributorList
-        for (uint256 i = 0; i < contributorList.length; i++) {
-            if (contributorList[i] == user) {
-                contributorList[i] = contributorList[contributorList.length - 1];
-                contributorList.pop();
-                break;
+        let mut allocated_amount: u64 = 0;
+        for contributor in state.contributors.iter_mut() {
+            if contributor.contribution > 0 {
+                let allocation = contributor
+                    .contribution
+                    .checked_mul(total_tokens)
+                    .ok_or(DistributionError::Overflow)?
+                    / state.total_raised;
+                contributor.allocation = allocation;
+                allocated_amount = allocated_amount
+                    .checked_add(allocation)
+                    .ok_or(DistributionError::Overflow)?;
             }
         }
 
-        emit ContributionUpdated(user, 0);
+        require!(allocated_amount <= total_tokens, DistributionError::AllocationExceedsBalance);
+
+        state.allocation_calculated = true;
+        emit!(DistributionEvent::AllocationsCalculated { total_raised: state.total_raised });
+        Ok(())
     }
 
-    /**
-     * @dev Updates contribution amount for a specific user
-     * @param user Address of contributor
-     * @param newAmount New contribution amount
-     * Requirements:
-     * - Only owner can call
-     * - Contract must not be paused
-     * - Allocations must not be calculated
-     * - Address must be a contributor
-     * - New amount cannot be zero
-     */
-    function updateContribution(address user, uint256 newAmount) external onlyOwner whenNotPaused {
-        if (allocationCalculated) revert ContributionsLocked();
-        if (!isContributor[user]) revert NotContributor();
-        if (newAmount == 0) revert ZeroAmount();
+    pub fn claim(ctx: Context<Claim>) -> Result<()> {
+        let state = &mut ctx.accounts.distribution_state;
+        require!(!state.paused, DistributionError::ContractPaused);
+        require!(state.claim_enabled, DistributionError::ClaimingNotEnabled);
+        require!(state.claim_period_open, DistributionError::ClaimPeriodClosed);
 
-        totalRaised -= contributions[user];
-        totalRaised += newAmount;
-        contributions[user] = newAmount;
+        let authority_key = ctx.accounts.authority.key();
+        let contributor = state
+            .contributors
+            .iter_mut()
+            .find(|c| c.user == authority_key)
+            .ok_or(DistributionError::NotContributor)?;
+        
+        let claim_amount = contributor.allocation;
+        require!(claim_amount > 0, DistributionError::NothingToClaim);
+        contributor.allocation = 0; // Reset before transferring
 
-        emit ContributionUpdated(user, newAmount);
-    }
+        let transfer_cpi_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.from.to_account_info(),
+                to: ctx.accounts.to.to_account_info(),
+                authority: ctx.accounts.from.to_account_info(),
+            },
+        );
 
-    // View Functions
-
-    /**
-     * @dev Returns list of all contributors
-     * @return Array of contributor addresses
-     */
-    function getContributors() external view returns (address[] memory) {
-        return contributorList;
-    }
-
-    /**
-     * @dev Returns total number of contributors
-     * @return Number of contributors
-     */
-    function getContributorCount() external view returns (uint256) {
-        return contributorList.length;
-    }
-
-    /**
-     * @dev Returns allocation for a specific user
-     * @param user Address to check
-     * @return Amount of tokens allocated
-     */
-    function getAllocation(address user) external view returns (uint256) {
-        return allocations[user];
-    }
-
-    /**
-     * @dev Pauses all contract operations
-     * Requirements:
-     * - Only owner can call
-     */
-    function pause() external onlyOwner {
-        _pause();
-    }
-
-    /**
-     * @dev Unpauses contract operations
-     * Requirements:
-     * - Only owner can call
-     */
-    function unpause() external onlyOwner {
-        _unpause();
+        token::transfer(transfer_cpi_ctx, claim_amount)?;
+        emit!(DistributionEvent::Claimed { user: authority_key, amount: claim_amount });
+        Ok(())
     }
 }
