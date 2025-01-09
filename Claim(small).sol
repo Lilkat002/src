@@ -1,25 +1,36 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+// Import required OpenZeppelin contracts
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 
+/**
+ * @title PeacepalAIDistribution
+ * @dev Contract for managing token distribution based on user contributions
+ * Inherits from:
+ * - Ownable: Manages contract ownership and access control
+ * - ReentrancyGuard: Prevents reentrancy attacks
+ * - Pausable: Allows pausing contract functionality in emergencies
+ */
 contract PeacepalAIDistribution is Ownable, ReentrancyGuard, Pausable {
-    IERC20 public token;
-    uint256 public totalRaised;
-    bool public allocationCalculated;
-    bool public claimEnabled;
-    uint256 public maxBatchSize;
-    bool public claimPeriodOpen;
+    // State Variables
+    IERC20 public token;              // The ERC20 token to be distributed
+    uint256 public totalRaised;       // Total amount of contributions
+    bool public allocationCalculated;  // Flag to track if allocations have been calculated
+    bool public claimEnabled;         // Flag to enable/disable claiming
+    uint256 public maxBatchSize;      // Maximum number of users in a batch operation
+    bool public claimPeriodOpen;      // Flag to track if claim period is active
     
-    // Track contributors explicitly
-    address[] public contributorList;
-    mapping(address => bool) public isContributor;
-    mapping(address => uint256) public contributions;
-    mapping(address => uint256) public allocations;
+    // Data structures for tracking contributors and their allocations
+    address[] public contributorList;                    // List of all contributors
+    mapping(address => bool) public isContributor;       // Track if address is a contributor
+    mapping(address => uint256) public contributions;    // Amount contributed by each address
+    mapping(address => uint256) public allocations;      // Token allocation for each address
 
+    // Events for tracking contract state changes
     event TokenSet(address indexed tokenAddress);
     event ContributionsUpdated(address[] users, uint256[] amounts);
     event ContributionUpdated(address indexed user, uint256 amount);
@@ -31,6 +42,7 @@ contract PeacepalAIDistribution is Ownable, ReentrancyGuard, Pausable {
     event ClaimPeriodOpened();
     event ClaimPeriodClosed();
 
+    // Custom errors for better gas efficiency and clearer error messages
     error ZeroAddress();
     error ZeroAmount();
     error BatchTooLarge();
@@ -48,10 +60,22 @@ contract PeacepalAIDistribution is Ownable, ReentrancyGuard, Pausable {
     error ContributionsLocked();
     error ClaimPeriodActive();
 
+    /**
+     * @dev Constructor sets initial maxBatchSize and initializes Ownable
+     */
     constructor() Ownable(msg.sender) {
         maxBatchSize = 500; // Default batch size
     }
 
+    /**
+     * @dev Sets the token address for distribution
+     * @param _token Address of the ERC20 token
+     * Requirements:
+     * - Only owner can call
+     * - Contract must not be paused
+     * - Token address cannot be zero
+     * - Claim period must not be active
+     */
     function setToken(address _token) external onlyOwner whenNotPaused {
         if (_token == address(0)) revert ZeroAddress();
         if (claimPeriodOpen) revert ClaimPeriodActive();
@@ -60,12 +84,29 @@ contract PeacepalAIDistribution is Ownable, ReentrancyGuard, Pausable {
         emit TokenSet(_token);
     }
 
+    /**
+     * @dev Updates the maximum batch size for contribution operations
+     * @param newSize New maximum batch size
+     * Requirements:
+     * - Only owner can call
+     * - New size cannot be zero
+     */
     function setMaxBatchSize(uint256 newSize) external onlyOwner {
         if (newSize == 0) revert ZeroAmount();
         maxBatchSize = newSize;
         emit MaxBatchSizeUpdated(newSize);
     }
 
+    /**
+     * @dev Batch sets contributions for multiple users
+     * @param users Array of user addresses
+     * @param amounts Array of contribution amounts
+     * Requirements:
+     * - Only owner can call
+     * - Contract must not be paused
+     * - Allocations must not be already calculated
+     * - Arrays must be same length and not exceed maxBatchSize
+     */
     function batchSetContributions(
         address[] calldata users,
         uint256[] calldata amounts
@@ -78,7 +119,7 @@ contract PeacepalAIDistribution is Ownable, ReentrancyGuard, Pausable {
             if (users[i] == address(0)) revert ZeroAddress();
             if (amounts[i] == 0) revert ZeroAmount();
             
-            // Add new contributor to list
+            // Add new contributor to list if not already present
             if (!isContributor[users[i]]) {
                 isContributor[users[i]] = true;
                 contributorList.push(users[i]);
@@ -87,15 +128,24 @@ contract PeacepalAIDistribution is Ownable, ReentrancyGuard, Pausable {
             // Update totalRaised by adding new amount and subtracting previous contribution
             totalRaised = totalRaised + amounts[i] - contributions[users[i]];
             
-            // Set contribution
+            // Set contribution and emit event
             contributions[users[i]] = amounts[i];
-
             emit ContributionUpdated(users[i], amounts[i]);
         }
 
         emit ContributionsUpdated(users, amounts);
     }
 
+    /**
+     * @dev Calculates token allocations based on contributions
+     * Requirements:
+     * - Only owner can call
+     * - Contract must not be paused
+     * - Token must be set
+     * - Must have contributions
+     * - Allocations must not be already calculated
+     * - Contract must have token balance
+     */
     function calculateAllocations() external onlyOwner whenNotPaused {
         if (address(token) == address(0)) revert ZeroAddress();
         if (totalRaised == 0) revert NoContributions();
@@ -106,6 +156,7 @@ contract PeacepalAIDistribution is Ownable, ReentrancyGuard, Pausable {
 
         uint256 allocatedAmount;
         
+        // Calculate proportional allocations for each contributor
         for (uint256 i = 0; i < contributorList.length; i++) {
             address user = contributorList[i];
             uint256 userContribution = contributions[user];
@@ -123,23 +174,51 @@ contract PeacepalAIDistribution is Ownable, ReentrancyGuard, Pausable {
         emit AllocationCalculated(totalRaised, totalTokens);
     }
 
+    /**
+     * @dev Enables token claiming
+     * Requirements:
+     * - Only owner can call
+     * - Contract must not be paused
+     * - Allocations must be calculated
+     */
     function enableClaim() external onlyOwner whenNotPaused {
         if (!allocationCalculated) revert NotCalculated();
         claimEnabled = true;
         emit ClaimEnabled();
     }
 
+    /**
+     * @dev Opens the claim period
+     * Requirements:
+     * - Only owner can call
+     * - Contract must not be paused
+     * - Claiming must be enabled
+     */
     function openClaimPeriod() external onlyOwner whenNotPaused {
         if (!claimEnabled) revert ClaimingNotEnabled();
         claimPeriodOpen = true;
         emit ClaimPeriodOpened();
     }
 
+    /**
+     * @dev Closes the claim period
+     * Requirements:
+     * - Only owner can call
+     * - Contract must not be paused
+     */
     function closeClaimPeriod() external onlyOwner whenNotPaused {
         claimPeriodOpen = false;
         emit ClaimPeriodClosed();
     }
 
+    /**
+     * @dev Allows users to claim their allocated tokens
+     * Requirements:
+     * - Contract must not be paused
+     * - Claiming must be enabled and period must be open
+     * - User must have allocation to claim
+     * - Transfer must succeed
+     */
     function claim() external nonReentrant whenNotPaused {
         if (!claimEnabled) revert ClaimingNotEnabled();
         if (!claimPeriodOpen) revert ClaimingNotEnabled();
@@ -154,6 +233,15 @@ contract PeacepalAIDistribution is Ownable, ReentrancyGuard, Pausable {
         emit TokensClaimed(msg.sender, amount);
     }
 
+    /**
+     * @dev Allows owner to withdraw unclaimed tokens
+     * Requirements:
+     * - Only owner can call
+     * - Contract must not be paused
+     * - Allocations must be calculated
+     * - Claim period must not be active
+     * - Transfer must succeed
+     */
     function withdrawUnclaimedTokens() external onlyOwner whenNotPaused {
         if (!allocationCalculated) revert NotCalculated();
         if (claimPeriodOpen) revert ClaimPeriodActive();
@@ -168,19 +256,27 @@ contract PeacepalAIDistribution is Ownable, ReentrancyGuard, Pausable {
         if (!success) revert TransferFailed();
     }
 
+    /**
+     * @dev Removes a contributor and their contribution
+     * @param user Address of contributor to remove
+     * Requirements:
+     * - Only owner can call
+     * - Contract must not be paused
+     * - Allocations must not be calculated
+     * - Address must be a contributor
+     */
     function removeContributor(address user) external onlyOwner whenNotPaused {
         if (allocationCalculated) revert ContributionsLocked();
         if (!isContributor[user]) revert NotContributor();
         
-        // Remove from mapping
+        // Remove from mapping and update total
         isContributor[user] = false;
         totalRaised -= contributions[user];
         contributions[user] = 0;
 
-        // Remove from contributorList
+        // Remove from contributorList using swap and pop
         for (uint256 i = 0; i < contributorList.length; i++) {
             if (contributorList[i] == user) {
-                // Move the last element to this position and pop
                 contributorList[i] = contributorList[contributorList.length - 1];
                 contributorList.pop();
                 break;
@@ -190,32 +286,59 @@ contract PeacepalAIDistribution is Ownable, ReentrancyGuard, Pausable {
         emit ContributionUpdated(user, 0);
     }
 
+    /**
+     * @dev Updates contribution amount for a specific user
+     * @param user Address of contributor
+     * @param newAmount New contribution amount
+     * Requirements:
+     * - Only owner can call
+     * - Contract must not be paused
+     * - Allocations must not be calculated
+     * - Address must be a contributor
+     * - New amount cannot be zero
+     */
     function updateContribution(address user, uint256 newAmount) external onlyOwner whenNotPaused {
         if (allocationCalculated) revert ContributionsLocked();
         if (!isContributor[user]) revert NotContributor();
         if (newAmount == 0) revert ZeroAmount();
 
-        // Update total raised
+        // Update total raised and contribution
         totalRaised = totalRaised - contributions[user] + newAmount;
         contributions[user] = newAmount;
 
         emit ContributionUpdated(user, newAmount);
     }
 
-    // View functions
+    /**
+     * @dev Returns list of all contributors
+     * @return Array of contributor addresses
+     */
     function getContributors() external view returns (address[] memory) {
         return contributorList;
     }
 
+    /**
+     * @dev Returns total number of contributors
+     * @return Number of contributors
+     */
     function getContributorCount() external view returns (uint256) {
         return contributorList.length;
     }
 
-    // Emergency functions
+    /**
+     * @dev Pauses all contract operations
+     * Requirements:
+     * - Only owner can call
+     */
     function pause() external onlyOwner {
         _pause();
     }
 
+    /**
+     * @dev Unpauses contract operations
+     * Requirements:
+     * - Only owner can call
+     */
     function unpause() external onlyOwner {
         _unpause();
     }
