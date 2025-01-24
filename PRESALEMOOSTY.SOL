@@ -1,0 +1,205 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
+/**
+ * @title PresaleContract
+ * @dev Implements a presale contract with whitelist and contribution limits
+ */
+contract PresaleContract is Ownable, ReentrancyGuard, Pausable {
+    using SafeERC20 for IERC20;
+
+    // State variables
+    IERC20 public immutable usdt; // USDT token contract
+    uint256 public hardCap;
+    uint256 public minContribution;
+    uint256 public maxContribution;
+    uint256 public totalRaised;
+    
+    mapping(address => bool) public whitelist;
+    mapping(address => uint256) public contributions;
+    
+    // Events
+    event WhitelistUpdated(address indexed user, bool status);
+    event ContributionReceived(address indexed contributor, uint256 amount);
+    event ContributionLimitsUpdated(uint256 minContribution, uint256 maxContribution);
+    event HardCapUpdated(uint256 newHardCap);
+    event FundsWithdrawn(address indexed owner, uint256 amount);
+
+    // Custom errors
+    error ContributionTooLow(uint256 sent, uint256 minimum);
+    error ContributionTooHigh(uint256 sent, uint256 maximum);
+    error HardCapExceeded(uint256 attempted, uint256 remaining);
+    error NotWhitelisted(address user);
+    error ZeroAddress();
+    error ZeroAmount();
+
+    /**
+     * @dev Constructor to set initial parameters
+     * @param _usdt USDT token contract address
+     * @param _hardCap Maximum amount that can be raised (in USDT)
+     * @param _minContribution Minimum contribution amount per user (in USDT)
+     * @param _maxContribution Maximum contribution amount per user (in USDT)
+     */
+    constructor(
+        address _usdt,
+        uint256 _hardCap,
+        uint256 _minContribution,
+        uint256 _maxContribution
+    ) Ownable(msg.sender) {
+        if (_usdt == address(0)) revert ZeroAddress();
+        if (_hardCap == 0) revert ZeroAmount();
+        if (_minContribution == 0) revert ZeroAmount();
+        if (_maxContribution < _minContribution) revert ContributionTooLow(_maxContribution, _minContribution);
+
+        usdt = IERC20(_usdt);
+        hardCap = _hardCap;
+        minContribution = _minContribution;
+        maxContribution = _maxContribution;
+    }
+
+    /**
+     * @dev Modifier to check if user is whitelisted
+     */
+    modifier onlyWhitelisted() {
+        if (!whitelist[msg.sender]) revert NotWhitelisted(msg.sender);
+        _;
+    }
+
+    /**
+     * @dev Function to update whitelist status for a user
+     * @param _user Address to update
+     * @param _status Whitelist status to set
+     */
+    function updateWhitelist(address _user, bool _status) external onlyOwner {
+        if (_user == address(0)) revert ZeroAddress();
+        whitelist[_user] = _status;
+        emit WhitelistUpdated(_user, _status);
+    }
+
+    /**
+     * @dev Batch update whitelist status for multiple users
+     * @param _users Array of addresses to update
+     * @param _status Whitelist status to set
+     */
+    function batchUpdateWhitelist(address[] calldata _users, bool _status) external onlyOwner {
+        for (uint256 i = 0; i < _users.length; i++) {
+            if (_users[i] == address(0)) revert ZeroAddress();
+            whitelist[_users[i]] = _status;
+            emit WhitelistUpdated(_users[i], _status);
+        }
+    }
+
+    /**
+     * @dev Function to contribute USDT
+     * @param _amount Amount of USDT to contribute
+     */
+    function contribute(uint256 _amount) external nonReentrant whenNotPaused onlyWhitelisted {
+        // Check contribution limits
+        if (_amount < minContribution) revert ContributionTooLow(_amount, minContribution);
+        if (_amount > maxContribution) revert ContributionTooHigh(_amount, maxContribution);
+        
+        uint256 newTotal = totalRaised + _amount;
+        if (newTotal > hardCap) revert HardCapExceeded(_amount, hardCap - totalRaised);
+
+        uint256 newUserTotal = contributions[msg.sender] + _amount;
+        if (newUserTotal > maxContribution) revert ContributionTooHigh(newUserTotal, maxContribution);
+
+        // Transfer USDT from user to contract
+        usdt.safeTransferFrom(msg.sender, address(this), _amount);
+
+        // Update state
+        contributions[msg.sender] = newUserTotal;
+        totalRaised = newTotal;
+
+        emit ContributionReceived(msg.sender, _amount);
+    }
+
+    /**
+     * @dev Update contribution limits
+     * @param _minContribution New minimum contribution
+     * @param _maxContribution New maximum contribution
+     */
+    function updateContributionLimits(uint256 _minContribution, uint256 _maxContribution) external onlyOwner {
+        if (_minContribution == 0) revert ZeroAmount();
+        if (_maxContribution < _minContribution) revert ContributionTooLow(_maxContribution, _minContribution);
+        
+        minContribution = _minContribution;
+        maxContribution = _maxContribution;
+        
+        emit ContributionLimitsUpdated(_minContribution, _maxContribution);
+    }
+
+    /**
+     * @dev Update hard cap
+     * @param _newHardCap New hard cap value
+     */
+    function updateHardCap(uint256 _newHardCap) external onlyOwner {
+        if (_newHardCap == 0) revert ZeroAmount();
+        if (_newHardCap < totalRaised) revert ContributionTooLow(_newHardCap, totalRaised);
+        
+        hardCap = _newHardCap;
+        emit HardCapUpdated(_newHardCap);
+    }
+
+    /**
+     * @dev Withdraw tokens from contract (USDT or accidentally sent tokens)
+     * @param _token Token address to withdraw
+     * @param _amount Amount to withdraw
+     */
+    function withdraw(address _token, uint256 _amount) external onlyOwner nonReentrant {
+        if (_token == address(0)) revert ZeroAddress();
+        if (_amount == 0) revert ZeroAmount();
+        
+        uint256 balance = IERC20(_token).balanceOf(address(this));
+        if (_amount > balance) revert ContributionTooHigh(_amount, balance);
+        
+        IERC20(_token).safeTransfer(msg.sender, _amount);
+        emit FundsWithdrawn(msg.sender, _amount);
+    }
+
+    /**
+     * @dev Pause the contract
+     */
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    /**
+     * @dev Unpause the contract
+     */
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    /**
+     * @dev View function to check if an address is whitelisted
+     * @param _user Address to check
+     * @return bool Whitelist status
+     */
+    function isWhitelisted(address _user) external view returns (bool) {
+        return whitelist[_user];
+    }
+
+    /**
+     * @dev View function to get user contribution
+     * @param _user Address to check
+     * @return uint256 User's total contribution
+     */
+    function getUserContribution(address _user) external view returns (uint256) {
+        return contributions[_user];
+    }
+
+    receive() external payable {
+        revert("Contract does not accept ETH");
+    }
+
+    fallback() external payable {
+        revert("Contract does not accept ETH");
+    }
+} 
